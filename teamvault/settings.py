@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 from huey import SqliteHuey
@@ -79,6 +80,10 @@ ROOT_URLCONF = 'teamvault.urls'
 SECRET_KEY = configure_django_secret_key(CONFIG)
 
 SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+
+_csrf_origins = os.environ.get('CSRF_TRUSTED_ORIGINS', '')
+if _csrf_origins:
+    CSRF_TRUSTED_ORIGINS = [o.strip() for o in _csrf_origins.split(',') if o.strip()]
 
 SESSION_ENGINE = 'django.contrib.sessions.backends.signed_cookies'
 SESSION_COOKIE_AGE, SESSION_EXPIRE_AT_BROWSER_CLOSE, SESSION_COOKIE_SECURE = configure_session(CONFIG)
