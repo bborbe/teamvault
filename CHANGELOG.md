@@ -1,3 +1,7 @@
+## Unreleased
+
+* feat(tests): add Playwright e2e smoke tests against a deployed instance
+
 # Current releases
 
 You can find the current release notes per version in https://github.com/seibert-media/teamvault/releases
