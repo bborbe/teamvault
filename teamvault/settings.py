@@ -4,12 +4,14 @@ from pathlib import Path
 from huey import SqliteHuey
 
 from teamvault.apps.settings.config import (
+    configure_data_dir,
     configure_database,
     configure_django_secret_key,
     configure_hashid,
     configure_huey,
     configure_logging,
     configure_session,
+    configure_template_loaders,
     configure_time_zone,
     get_config,
 )
@@ -99,7 +101,6 @@ TEMPLATES = [
     {
         'BACKEND': 'django.template.backends.django.DjangoTemplates',
         'DIRS': [str(PROJECT_ROOT / 'templates')],
-        'APP_DIRS': True,
         'OPTIONS': {
             'context_processors': [
                 'django.contrib.auth.context_processors.auth',
@@ -113,6 +114,7 @@ TEMPLATES = [
                 'teamvault.apps.accounts.context_processors.google_auth_enabled',
                 'teamvault.apps.secrets.context_processors.version',
             ],
+            'loaders': configure_template_loaders(CONFIG),
         },
     },
 ]
@@ -148,5 +150,6 @@ BOOTSTRAP5 = {
     'error_css_class': 'is-invalid',
 }
 
-HUEY = SqliteHuey('teamvault')
+DATA_DIR = configure_data_dir(CONFIG)
 HUEY_TASKS = configure_huey(CONFIG)
+HUEY = SqliteHuey('teamvault', filename=str(DATA_DIR / 'huey.db'))

@@ -1,25 +1,32 @@
+import csv
+from functools import cached_property
+
 from django.contrib import messages
 from django.contrib.auth import get_user_model
 from django.contrib.auth.decorators import login_required, user_passes_test
+from django.contrib.auth.models import Group
 from django.db import transaction
-from django.db.models import Q
+from django.db.models import Count, Max, Q
 from django.http import (
-    HttpResponseBadRequest,
+    HttpResponse,
     HttpResponseRedirect,
     JsonResponse,
 )
 from django.shortcuts import get_object_or_404, render
 from django.urls import reverse, reverse_lazy
+from django.utils.timezone import now
 from django.utils.translation import gettext_lazy as _
 from django.views.decorators.http import require_http_methods
 from django.views.generic import DetailView, ListView, UpdateView
 
 from teamvault.apps.secrets.enums import SecretStatus
+from teamvault.views import PageSizeMixin
 from .forms import UserProfileForm
 from .models import UserProfile as UserProfileModel
+from .utils import get_pending_secrets_for_user
 from ..audit.auditlog import log
 from ..audit.models import AuditLogCategoryChoices
-from ..secrets.models import SecretRevision
+from ..secrets.models import Secret
 
 User = get_user_model()
 
@@ -42,7 +49,7 @@ class UserProfile(UpdateView):
 user_settings = login_required(UserProfile.as_view())
 
 
-class UserList(ListView):
+class UserList(PageSizeMixin, ListView):
     context_object_name = 'users'
     model = User
     paginate_by = 25
@@ -66,13 +73,117 @@ class UserDetail(DetailView):
 user_detail = user_passes_test(lambda u: u.is_superuser)(UserDetail.as_view())
 
 
+class UserPendingSecretsView(PageSizeMixin, ListView):
+    paginate_by = 10
+    context_object_name = 'pending_secrets'
+    template_name = 'accounts/user_pending_secrets.html'
+
+    @cached_property
+    def user_object(self):
+        return get_object_or_404(User, username=self.kwargs['username'])
+
+    def dispatch(self, request, *args, **kwargs):
+        if self.user_object.is_active:
+            redirect_url = reverse_lazy('accounts.user-detail', kwargs={'username': self.user_object.username})
+            return HttpResponseRedirect(redirect_url)
+
+        return super().dispatch(request, *args, **kwargs)
+
+    def get_queryset(self):
+        qs = get_pending_secrets_for_user(self.user_object)
+        query = self.request.GET.get('q')
+
+        if query:
+            qs = qs.filter(name__icontains=query)
+        return qs
+
+    def get_context_data(self, **kwargs):
+        ctx = super().get_context_data(**kwargs)
+        page_secrets = ctx['pending_secrets']
+        secret_ids = [s.id for s in page_secrets]
+
+        readable_secret_ids = set(
+            Secret.get_all_readable_by_user(self.request.user).filter(id__in=secret_ids).values_list('id', flat=True)
+        )
+
+        for secret in page_secrets:
+            secret.readable_for_admin = secret.id in readable_secret_ids
+
+        ctx['is_htmx'] = self.request.headers.get('HX-Request') == 'true'
+        ctx['deactivated_user'] = self.user_object
+        ctx['user'] = self.user_object
+
+        return ctx
+
+    def get_template_names(self):
+        if self.request.headers.get('HX-Request') == 'true':
+            # If searching or paginating, returning only the table content
+            if (
+                self.request.GET.get('q') is not None
+                or self.request.GET.get('page')
+                or self.request.GET.get('page_size')
+            ):
+                return [f'{self.template_name}#user-pending-secrets-content']
+            # Otherwise (initial load via HTMX), return the full container
+            return [f'{self.template_name}#user-pending-secrets-container']
+
+        return [self.template_name]
+
+
+user_pending_secrets = user_passes_test(lambda u: u.is_superuser)(UserPendingSecretsView.as_view())
+
+
 @user_passes_test(lambda u: u.is_superuser)
-def user_detail_from_request(request):
-    username = request.GET.get('username', '').strip()
-    if not username:
-        return HttpResponseBadRequest(_('Username is required'))
-    user = get_object_or_404(User, username=username)
-    return HttpResponseRedirect(reverse('accounts.user-detail', kwargs={'username': user}))
+def user_pending_secrets_csv(request, username):
+    user_obj = get_object_or_404(User, username=username)
+
+    pending_qs = get_pending_secrets_for_user(user_obj)
+
+    query = request.GET.get('q')
+    if query:
+        pending_qs = pending_qs.filter(name__icontains=query)
+
+    # NOTE: If a share was created and then deleted, it is gone from this calculation.
+    # It only tracks currently active shares.
+    pending_qs = pending_qs.annotate(last_shared=Max('share_data__granted_on'))
+
+    log(
+        _('{actor} exported pending secrets CSV for {user}').format(
+            actor=request.user.username,
+            user=user_obj.username,
+        ),
+        actor=request.user,
+        category=AuditLogCategoryChoices.DATA_EXPORT,
+        user=user_obj,
+    )
+
+    response = HttpResponse(
+        content_type='text/csv',
+        headers={'Content-Disposition': f'attachment; filename="{username}_pending_secrets.csv"'},
+    )
+
+    writer = csv.writer(response)
+    writer.writerow(['Name', 'HashID', 'Type', 'URL', 'Status', 'Last Changed', 'Last Read', 'Last Shared'])
+
+    for secret in pending_qs:
+        full_url = request.build_absolute_uri(secret.get_absolute_url())
+
+        last_shared = secret.last_shared.isoformat() if secret.last_shared else ''
+        last_changed = secret.last_changed.isoformat() if secret.last_changed else ''
+        last_read = secret.last_read.isoformat() if secret.last_read else ''
+
+        writer.writerow([
+            secret.name,
+            secret.hashid,
+            secret.get_content_type_display(),
+            full_url,
+            secret.get_status_display(),
+            last_changed,
+            last_read,
+            last_shared,
+        ])
+
+    return response
 
 
 @user_passes_test(lambda u: u.is_superuser)
@@ -87,23 +198,12 @@ def user_activate(request, username, deactivate=False):
     user.save()
     if deactivate:
         user.groups.clear()
-        accessed_revs = (
-            SecretRevision.objects
-            .filter(
-                accessed_by=user,
-            )
-            .exclude(
-                secret__needs_changing_on_leave=False,
-            )
-            .exclude(secret__status=SecretStatus.NEEDS_CHANGING)
-            .select_related(
-                'secret',
-            )
+        secrets = list(
+            Secret.objects.filter(
+                current_revision__accessed_by=user,
+                needs_changing_on_leave=True,
+            ).exclude(status=SecretStatus.NEEDS_CHANGING)
         )
-        secrets = set()
-        for rev in accessed_revs:
-            if rev.is_current_revision:
-                secrets.add(rev.secret)
         with transaction.atomic():
             for secret in secrets:
                 secret.status = SecretStatus.NEEDS_CHANGING
@@ -119,6 +219,7 @@ def user_activate(request, username, deactivate=False):
                     secret=secret,
                     user=user,
                 )
+
         log(
             _('{actor} deactivated {user}, {secrets} secrets marked for changing').format(
                 actor=request.user.username,
@@ -129,6 +230,9 @@ def user_activate(request, username, deactivate=False):
             category=AuditLogCategoryChoices.USER_DEACTIVATED,
             user=user,
         )
+
+        detail_url = reverse('accounts.user-detail', kwargs={'username': user.username})
+
     else:
         log(
             _('{actor} reactivated {user}').format(
@@ -139,7 +243,9 @@ def user_activate(request, username, deactivate=False):
             category=AuditLogCategoryChoices.USER_ACTIVATED,
             user=user,
         )
-    return HttpResponseRedirect(reverse('accounts.user-detail', kwargs={'username': user.username}))
+        detail_url = reverse('accounts.user-detail', kwargs={'username': user.username})
+
+    return HttpResponseRedirect(detail_url)
 
 
 def search_user(request):
@@ -154,7 +260,8 @@ def search_user(request):
     results: list[dict[str, str]] = [
         {
             'username': user.username,
-            'cn': f'{user.first_name} {user.last_name}'.strip(),
+            'cn': user.get_full_name() or user.username,
+            'url': reverse('accounts.user-detail', kwargs={'username': user.username}),
         }
         for user in users_queryset
     ]
@@ -169,3 +276,156 @@ def get_user_avatar_partial(request):
         return {}
     user = User.objects.get(username=username)
     return render(request, 'accounts/_avatar.html', {'user': user, 'tooltip_title': username})
+
+
+class UserGroupsList(PageSizeMixin, ListView):
+    context_object_name = 'user_groups'
+    paginate_by = 10
+    template_name = 'accounts/_user_groups.html'
+
+    @cached_property
+    def user_object(self):
+        return get_object_or_404(User, username=self.kwargs['username'])
+
+    def get(self, request, *args, **kwargs):
+        if request.headers.get('HX-Request') != 'true':
+            return HttpResponseRedirect(reverse('accounts.user-detail', kwargs={'username': self.kwargs['username']}))
+        return super().get(request, *args, **kwargs)
+
+    def get_queryset(self):
+        return self.user_object.groups.order_by('name')
+
+    def get_context_data(self, **kwargs):
+        ctx = super().get_context_data(**kwargs)
+        ctx['user'] = self.user_object
+        return ctx
+
+
+user_groups = user_passes_test(lambda u: u.is_superuser)(UserGroupsList.as_view())
+
+
+class GroupList(PageSizeMixin, ListView):
+    context_object_name = 'groups'
+    model = Group
+    paginate_by = 25
+    template_name = 'accounts/group_list.html'
+
+    def get_queryset(self):
+        return self.model.objects.annotate(
+            secret_count=Count(
+                'secret_share_data',
+                filter=Q(secret_share_data__granted_until__isnull=True) | Q(secret_share_data__granted_until__gt=now()),
+                distinct=True,
+            ),
+            member_count=Count('user', distinct=True),
+        ).order_by('name')
+
+
+groups = user_passes_test(lambda u: u.is_superuser)(GroupList.as_view())
+
+
+class GroupDetail(DetailView):
+    context_object_name = 'group'
+    model = Group
+    slug_field = 'name'
+    slug_url_kwarg = 'groupname'
+    template_name = 'accounts/group_detail.html'
+
+    def get_context_data(self, **kwargs):
+        ctx = super().get_context_data(**kwargs)
+        # only count secrets that are currently shared with the group
+        ctx['count_of_secrets_shared_with_group'] = self.object.secret_share_data.filter(
+            Q(granted_until__isnull=True) | Q(granted_until__gt=now())
+        ).count()
+        return ctx
+
+
+group_detail = user_passes_test(lambda u: u.is_superuser)(GroupDetail.as_view())
+
+
+def search_group(request):
+    if not request.user.is_superuser:
+        return {}
+    q = request.GET.get('q', '').strip()
+    if not q:
+        return {}
+    groups_queryset = Group.objects.filter(name__icontains=q)[:15]
+    results: list[dict[str, str]] = [
+        {
+            'name': group.name,
+            'url': reverse('accounts.group-detail', kwargs={'groupname': group.name}),
+        }
+        for group in groups_queryset
+    ]
+    return JsonResponse({'results': results})
+
+
+class GroupMemberList(PageSizeMixin, ListView):
+    context_object_name = 'group_members'
+    paginate_by = 10
+    template_name = 'accounts/_group_members.html'
+
+    @cached_property
+    def group_object(self):
+        return get_object_or_404(Group, name=self.kwargs['groupname'])
+
+    def get(self, request, *args, **kwargs):
+        if request.headers.get('HX-Request') != 'true':
+            return HttpResponseRedirect(
+                reverse('accounts.group-detail', kwargs={'groupname': self.kwargs['groupname']})
+            )
+        return super().get(request, *args, **kwargs)
+
+    def get_queryset(self):
+        qs = self.group_object.user_set.select_related('profile').order_by('username')
+        query = self.request.GET.get('q', '').strip()
+        if query:
+            return qs.filter(username__icontains=query)
+
+        return qs
+
+    def get_context_data(self, **kwargs):
+        ctx = super().get_context_data(**kwargs)
+        ctx['group'] = self.group_object
+        return ctx
+
+
+group_members = user_passes_test(lambda u: u.is_superuser)(GroupMemberList.as_view())
+
+
+class GroupSecretList(PageSizeMixin, ListView):
+    context_object_name = 'group_secrets'
+    paginate_by = 25
+    template_name = 'accounts/_group_secrets.html'
+
+    @cached_property
+    def group_object(self):
+        return get_object_or_404(Group, name=self.kwargs['groupname'])
+
+    def get(self, request, *args, **kwargs):
+        if request.headers.get('HX-Request') != 'true':
+            return HttpResponseRedirect(
+                reverse('accounts.group-detail', kwargs={'groupname': self.kwargs['groupname']})
+            )
+        return super().get(request, *args, **kwargs)
+
+    def get_queryset(self):
+        qs = (
+            self.group_object.secret_share_data
+            .filter(Q(granted_until__isnull=True) | Q(granted_until__gt=now()))
+            .select_related('secret', 'granted_by')
+            .order_by('secret__name')
+        )
+        query = self.request.GET.get('q', '').strip()
+        if query:
+            return qs.filter(secret__name__icontains=query)
+
+        return qs
+
+    def get_context_data(self, **kwargs):
+        ctx = super().get_context_data(**kwargs)
+        ctx['group'] = self.group_object
+        return ctx
+
+
+group_secrets = user_passes_test(lambda u: u.is_superuser)(GroupSecretList.as_view())

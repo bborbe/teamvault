@@ -1,6 +1,6 @@
 # TeamVault
 
-TeamVault is an open-source web-based shared password manager for behind-the-firewall installation. It requires Python 3.10+ and PostgreSQL (with the unaccent extension).
+TeamVault is an open-source web-based shared password manager for behind-the-firewall installation. It requires Python 3.12+ and PostgreSQL (with the unaccent extension).
 
 ## Installation
 
@@ -10,9 +10,12 @@ TeamVault is an open-source web-based shared password manager for behind-the-fir
 	vim /etc/teamvault.conf
 	# note that the teamvault database user will need SUPERUSER privileges
 	# during this step in order to activate the unaccent extension
+	mkdir -p /var/lib/teamvault  # or whatever you set as `data_dir` in the config
 	teamvault upgrade
 	teamvault plumbing createsuperuser
 	teamvault run
+
+The `data_dir` setting in the `[teamvault]` section of the config file points to a writable directory used for runtime state (currently the huey scheduler's SQLite database). It defaults to `/var/lib/teamvault` and must exist and be writable by the user running TeamVault.
 
 ## Update
 
@@ -44,6 +47,7 @@ Some MacOS users have reported errors when running the dev server via bun. In th
 	vim teamvault.cfg  # base_url = http://localhost:8000
 	                   # session_cookie_secure = False
 	                   # database config as needed
+	                   # data_dir = /tmp  (or any writable path; default /var/lib/teamvault won't exist locally)
 	teamvault upgrade
 	teamvault plumbing createsuperuser
 
@@ -52,11 +56,6 @@ Some MacOS users have reported errors when running the dev server via bun. In th
 
 Now open http://localhost:8000
 
-## Scheduled background jobs
+## Further reading
 
-We use [huey](https://huey.readthedocs.io/en/latest/) to run background jobs. This requires you to run a second process, in parallel to TeamVault itself. You can launch it via `manage.py`:
-
-    teamvault run_huey
-
-## Release process
-Run the github action to cut a release with a specific version number.
+For more detailed documentation, visit the [TeamVault Wiki](https://github.com/seibert-media/teamvault/wiki).

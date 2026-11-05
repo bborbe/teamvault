@@ -1,8 +1,10 @@
 from copy import copy
+from datetime import timedelta
 from urllib.parse import urlencode
 
 from django.test import Client, TestCase, override_settings
 from django.urls import reverse
+from django.utils.timezone import now
 
 from teamvault.apps.secrets.enums import AccessPolicy, SecretStatus
 from teamvault.apps.secrets.models import (
@@ -17,12 +19,13 @@ RESTORE_URL_NAME = 'restore_secret_revision'
 
 @override_settings(**COMMON_OVERRIDES)
 class RestoreRevisionTests(TestCase):
-    def setUp(self):
-        # users
-        self.owner = make_user('owner')
-        self.su = make_user('root', superuser=True)
-        self.bob = make_user('bob')
+    @classmethod
+    def setUpTestData(cls):
+        cls.owner = make_user('owner')
+        cls.su = make_user('root', superuser=True)
+        cls.bob = make_user('bob')
 
+    def setUp(self):
         # secret with 2 payload revisions + 1 secret meta
         self.secret = new_secret(self.owner, access_policy=AccessPolicy.DISCOVERABLE)
         self.rev1 = self.secret.current_revision  # baseline
@@ -125,3 +128,26 @@ class RestoreRevisionTests(TestCase):
         RevisionService.save_payload(secret=self.secret, actor=self.owner, payload=payload)
         rows = RevisionService.get_revision_history(self.secret, self.owner)
         self.assertTrue(any(r.needs_changing for r in rows))
+
+    def test_temporary_reader_cannot_restore(self):
+        self._login(self.bob)
+        self.secret.share_data.create(user=self.bob, granted_by=self.owner, granted_until=now() + timedelta(days=1))
+        self.assertEqual(
+            self.secret.permission_checker(self.bob).is_readable(),
+            AccessPermissionTypes.TEMPORARILY_ALLOWED,
+        )
+
+        pre_rev = self.secret.current_revision
+        resp = self.client.post(self._restore_url(self.secret, self.rev1, self.ch_rev1.hashid))
+        self.assertEqual(resp.status_code, 403)
+
+        self.secret.refresh_from_db()
+        self.assertEqual(self.secret.current_revision, pre_rev)
+
+    def test_temporary_reader_does_not_get_restore_button(self):
+        self._login(self.bob)
+        self.secret.share_data.create(user=self.bob, granted_by=self.owner, granted_until=now() + timedelta(days=1))
+        url = reverse('secrets.revision-detail', args=(self.rev1.hashid,))
+        resp = self.client.get(url + '?' + urlencode({'change': self.ch_rev1.hashid}))
+        self.assertEqual(resp.status_code, 200)
+        self.assertFalse(resp.context['restore_allowed'])

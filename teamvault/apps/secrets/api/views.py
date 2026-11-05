@@ -1,19 +1,30 @@
 from base64 import b64encode
 
 from django.conf import settings
+from django.contrib.auth import get_user_model
+from django.core.exceptions import ValidationError as DjangoValidationError
+from django.db.models import FETCH_PEERS, Max
 from django.shortcuts import get_object_or_404
 from django.utils.translation import gettext_lazy as _
 from rest_framework import generics, status
 from rest_framework.decorators import api_view
-from rest_framework.exceptions import PermissionDenied
+from rest_framework.exceptions import PermissionDenied, ValidationError
+from rest_framework.permissions import SAFE_METHODS, IsAdminUser
 from rest_framework.response import Response
 
+from teamvault.apps.accounts.utils import get_pending_secrets_for_user
 from teamvault.apps.audit.auditlog import log
 from teamvault.apps.audit.models import AuditLogCategoryChoices
 from teamvault.apps.secrets.enums import ContentType, SecretStatus
 from teamvault.apps.secrets.exceptions import PermissionError as SecretPermissionError
 from teamvault.apps.secrets.services.revision import RevisionService
-from .serializers import SecretDetailSerializer, SecretRevisionSerializer, SecretSerializer, SharedSecretDataSerializer
+from .serializers import (
+    PendingSecretSerializer,
+    SecretDetailSerializer,
+    SecretRevisionSerializer,
+    SecretSerializer,
+    SharedSecretDataSerializer,
+)
 from ..models import AccessPermissionTypes, Secret, SecretRevision, SharedSecretData
 from ..utils import generate_password
 
@@ -30,15 +41,29 @@ class SecretDetail(generics.RetrieveUpdateDestroyAPIView):
 
     def get_object(self):
         obj = get_object_or_404(Secret, hashid=self.kwargs['hashid'])
-        if not obj.check_read_access(self.request.user):
+        if self.request.method in SAFE_METHODS:
+            allowed = obj.check_read_access(self.request.user)
+        else:
+            allowed = obj.check_edit_access(self.request.user)
+        if not allowed:
             self.permission_denied(self.request)
         return obj
 
     def perform_update(self, serializer):
-        instance = serializer.save()
-        if hasattr(instance, '_data'):
-            RevisionService.save_payload(secret=instance, actor=self.request.user, payload=instance._data)
-            del instance._data
+        instance: Secret = serializer.save()
+        if serializer.plaintext_payload is not None:
+            RevisionService.save_payload(
+                secret=instance,
+                actor=self.request.user,
+                payload=serializer.plaintext_payload,
+            )
+        # Only metadata changed
+        elif instance.current_revision:
+            RevisionService.save_payload(
+                secret=instance,
+                actor=self.request.user,
+                payload=None,
+            )
 
 
 class SecretList(generics.ListCreateAPIView):
@@ -47,23 +72,23 @@ class SecretList(generics.ListCreateAPIView):
 
     def get_queryset(self):
         if 'search' in self.request.query_params:
-            return Secret.get_search_results(
+            queryset = Secret.get_search_results(
                 self.request.user,
                 self.request.query_params['search'],
             )
         else:
-            return Secret.get_all_visible_to_user(self.request.user)
+            queryset = Secret.get_all_visible_to_user(self.request.user)
+        return queryset.fetch_mode(FETCH_PEERS)
 
     def perform_create(self, serializer):
         instance = serializer.save(created_by=self.request.user)
-        if hasattr(instance, '_data'):
+        if serializer.plaintext_payload is not None:
             RevisionService.save_payload(
                 secret=instance,
                 actor=self.request.user,
-                payload=instance._data,
+                payload=serializer.plaintext_payload,
                 skip_acl=True,
             )
-            del instance._data
 
 
 class SecretRevisionDetail(generics.RetrieveAPIView):
@@ -86,7 +111,7 @@ class SecretShare(generics.ListCreateAPIView):
 
     def get_queryset(self):
         obj = self.get_object()
-        return obj.share_data.all()
+        return obj.share_data.all().fetch_mode(FETCH_PEERS)
 
     def get_serializer_context(self):
         context = super().get_serializer_context()
@@ -95,27 +120,8 @@ class SecretShare(generics.ListCreateAPIView):
 
     def perform_create(self, serializer):
         secret = self.get_object()
-        permission = secret.is_shareable_by_user(self.request.user)
-        if not permission:
-            raise PermissionDenied
-
-        obj = serializer.save(granted_by=self.request.user, secret=secret)
-        log(
-            _("{user} granted access to {shared_entity_type} '{name}' {time}").format(
-                shared_entity_type=obj.shared_entity_type,
-                name=obj.shared_entity_name,
-                user=self.request.user.username,
-                time=_('until ') + obj.granted_until.isoformat() if obj.granted_until else _('permanently'),
-            ),
-            actor=self.request.user,
-            category=(
-                AuditLogCategoryChoices.SECRET_SUPERUSER_SHARED
-                if permission == AccessPermissionTypes.SUPERUSER_ALLOWED
-                else AuditLogCategoryChoices.SECRET_SHARED
-            ),
-            level='warning',
-            secret=secret,
-        )
+        secret.check_share_access(self.request.user)
+        serializer.save(granted_by=self.request.user, secret=secret)
 
 
 class SecretShareDetail(generics.RetrieveDestroyAPIView):
@@ -127,10 +133,7 @@ class SecretShareDetail(generics.RetrieveDestroyAPIView):
         return obj
 
     def perform_destroy(self, instance):
-        permission = instance.secret.is_shareable_by_user(self.request.user)
-        if not permission:
-            raise PermissionDenied()
-
+        permission = instance.check_delete_access(self.request.user)
         secret = instance.secret
         entity_type = instance.shared_entity_type
         entity_name = instance.shared_entity_name
@@ -189,5 +192,38 @@ def otp_get(request, hashid):
     secret_revision = get_object_or_404(SecretRevision, hashid=hashid)
     secret = secret_revision.secret
     secret.check_read_access(request.user)
-    otp = secret.get_otp(request)
+
+    if secret.content_type != ContentType.PASSWORD or not secret_revision.otp_key_set:
+        raise ValidationError([_('This secret has no OTP key.')])
+
+    try:
+        otp = secret.get_otp(request)
+    except DjangoValidationError as exc:
+        # This should only throw when an OTP has been set via the pre-fix API.
+        # All correctly set OTPs without "algorithm" still assume the SHA1 default.
+        raise ValidationError(exc.messages) from exc
     return Response(otp)
+
+
+class UserPendingSecretsList(generics.ListAPIView):
+    """
+    Returns a list of secrets that need changing for a specific user.
+    Used for offboarding automation.
+    """
+
+    serializer_class = PendingSecretSerializer
+    permission_classes = [IsAdminUser]
+
+    def get_queryset(self):
+        username = self.kwargs['username']
+        user = get_object_or_404(get_user_model(), username=username)
+
+        qs = get_pending_secrets_for_user(user)
+        # Annotate for the serializer
+        qs = qs.annotate(last_shared=Max('share_data__granted_on'))
+
+        query = self.request.query_params.get('q', None)
+        if query:
+            qs = qs.filter(name__icontains=query)
+
+        return qs

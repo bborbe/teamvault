@@ -3,10 +3,17 @@ from django.urls import path
 
 from .views import (
     get_user_avatar_partial,
+    group_detail,
+    group_members,
+    group_secrets,
+    groups,
+    search_group,
     search_user,
     user_activate,
     user_detail,
-    user_detail_from_request,
+    user_groups,
+    user_pending_secrets,
+    user_pending_secrets_csv,
     user_settings,
     users,
 )
@@ -33,11 +40,6 @@ urlpatterns = (
         name='accounts.user.avatar',
     ),
     path(
-        'users/detail/',
-        user_detail_from_request,
-        name='accounts.user-detail-from-request',
-    ),
-    path(
         'users/search/',
         search_user,
         name='accounts.search-user',
@@ -46,6 +48,16 @@ urlpatterns = (
         'users/<str:username>/',
         user_detail,
         name='accounts.user-detail',
+    ),
+    path(
+        'users/<str:username>/pending-secrets/',
+        user_pending_secrets,
+        name='accounts.user-pending-secrets',
+    ),
+    path(
+        'users/<str:username>/pending-secrets/csv/',
+        user_pending_secrets_csv,
+        name='accounts.user-pending-secrets-csv',
     ),
     path(
         'users/<str:username>/reactivate',
@@ -57,6 +69,36 @@ urlpatterns = (
         user_activate,
         {'deactivate': True},
         name='accounts.user-deactivate',
+    ),
+    path(
+        'users/<str:username>/groups/',
+        user_groups,
+        name='accounts.user-groups',
+    ),
+    path(
+        'groups/',
+        groups,
+        name='accounts.group-list',
+    ),
+    path(
+        'groups/search/',
+        search_group,
+        name='accounts.search-group',
+    ),
+    path(
+        'groups/<str:groupname>/members/',
+        group_members,
+        name='accounts.group-members',
+    ),
+    path(
+        'groups/<str:groupname>/secrets/',
+        group_secrets,
+        name='accounts.group-secrets',
+    ),
+    path(
+        'groups/<str:groupname>/',
+        group_detail,
+        name='accounts.group-detail',
     ),
     path(
         'settings/',

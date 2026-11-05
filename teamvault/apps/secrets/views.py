@@ -1,4 +1,3 @@
-import base64
 import contextlib
 from copy import copy
 from urllib.parse import quote, urlencode
@@ -9,6 +8,7 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.decorators import login_required, user_passes_test
 from django.contrib.auth.models import Group
 from django.core.exceptions import ObjectDoesNotExist, PermissionDenied
+from django.db.models import FETCH_PEERS
 from django.http import Http404, HttpResponse, HttpResponseRedirect, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.template.defaultfilters import pluralize
@@ -31,7 +31,7 @@ from .utils import serialize_add_edit_data
 from ..accounts.models import UserProfile
 from ..audit.auditlog import log
 from ..audit.models import AuditLogCategoryChoices
-from ...views import FilterMixin
+from ...views import FilterMixin, PageSizeMixin
 
 User = get_user_model()
 
@@ -59,10 +59,14 @@ class Dashboard(TemplateView):
 
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
+        most_used = Secret.get_most_used_for_user(self.request.user, 10)
+        recently_used = Secret.get_most_recently_used_for_user(self.request.user, 10)
         context['search_term'] = ''
-        context['most_used_secrets'] = Secret.get_most_used_for_user(self.request.user, 10)
-        context['readable_secrets'] = Secret.get_all_readable_by_user(self.request.user)
-        context['recently_used_secrets'] = Secret.get_most_recently_used_for_user(self.request.user, 10)
+        context['most_used_secrets'] = most_used
+        context['recently_used_secrets'] = recently_used
+        context['readable_secret_ids'] = Secret.get_readable_ids_in_queryset(
+            self.request.user, most_used + recently_used
+        )
         return context
 
 
@@ -121,6 +125,7 @@ class SecretAdd(CreateView):
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
         try:
+            context['content_type'] = self.kwargs['content_type']
             context['pretty_content_type'] = CONTENT_TYPE_NAMES[self.kwargs['content_type']]
         except KeyError as exc:
             raise Http404 from exc
@@ -167,18 +172,13 @@ class SecretEdit(UpdateView):
         secret.save()
         plaintext_data = serialize_add_edit_data(form.cleaned_data, secret)
 
-        if not plaintext_data:  # Only metadata changed
-            # Re-use the existing encrypted data to create a new revision
+        # Only metadata changed
+        if not plaintext_data:
             if form.changed_data and secret.current_revision:
-                # Avoid logging a read for internal book-keeping
-                current_data = secret.current_revision.peek_data(self.request.user)
-                if secret.content_type == ContentType.FILE and isinstance(current_data, (bytes, bytearray)):
-                    # Keep current data on metadata-only edit
-                    current_data = {'file_content': base64.b64encode(current_data).decode()}
                 RevisionService.save_payload(
                     secret=secret,
                     actor=self.request.user,
-                    payload=current_data,
+                    payload=None,
                 )
         else:
             RevisionService.save_payload(
@@ -187,17 +187,11 @@ class SecretEdit(UpdateView):
                 payload=plaintext_data,
             )
 
-        # clear saved otp key data cache after change
-        if (
-            'otp_key_data' in form.changed_data
-            and form.cleaned_data.get('otp_key_data')
-            and 'otp_key_data' in self.request.session
-        ):
-            del self.request.session['otp_key_data']
         return HttpResponseRedirect(secret.get_absolute_url())
 
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
+        context['content_type'] = CONTENT_TYPE_IDENTIFIERS[self.object.content_type]
         context['current_revision'] = self.object.current_revision
         context['pretty_content_type'] = self.object.get_content_type_display()
         return context
@@ -234,7 +228,7 @@ class SecretEdit(UpdateView):
 
     def get_object(self, queryset=None):  # noqa: ARG002
         secret = get_object_or_404(Secret, hashid=self.kwargs['hashid'])
-        secret.check_read_access(self.request.user)
+        secret.check_edit_access(self.request.user)
         return secret
 
     def get_template_names(self):
@@ -247,7 +241,7 @@ secret_edit = login_required(SecretEdit.as_view())
 @login_required
 def secret_delete(request, hashid):
     secret = get_object_or_404(Secret, hashid=hashid)
-    secret.check_read_access(request.user)
+    secret.check_edit_access(request.user)
     if request.method == 'POST':
         log(
             _("{user} deleted '{name}' ({id}:{revision})").format(
@@ -327,6 +321,7 @@ class SecretDetail(DetailView):
         context['ContentType'] = ContentType
         context['content_type'] = CONTENT_TYPE_IDENTIFIERS[secret.content_type]
         context['secret_revision'] = secret.current_revision
+        context['editable'] = permissions.is_editable()
         context['readable'] = permissions.is_readable()
         context['shareable'] = permissions.is_shareable()
         context['secret_deleted'] = secret.status == SecretStatus.DELETED
@@ -362,7 +357,7 @@ secret_detail = login_required(SecretDetail.as_view())
 @require_http_methods(['GET'])
 def secret_metadata(request, hashid):
     secret = get_object_or_404(Secret, hashid=hashid)
-    share_data = secret.share_data.with_expiry_state().filter(is_expired=False)
+    share_data = secret.share_data.with_expiry_state().filter(is_expired=False).fetch_mode(FETCH_PEERS)
     context = {
         'allowed_groups': share_data.groups(),
         'allowed_users': share_data.users(),
@@ -371,7 +366,7 @@ def secret_metadata(request, hashid):
     return render(request, context=context, template_name='secrets/detail_content/meta.html')
 
 
-class SecretList(ListView, FilterMixin):
+class SecretList(PageSizeMixin, ListView, FilterMixin):
     context_object_name = 'secrets'
     filter = None
     filter_class = SecretFilter
@@ -383,7 +378,7 @@ class SecretList(ListView, FilterMixin):
         context['SecretStatus'] = SecretStatus
         context['ContentType'] = ContentType
         context['filter'] = self._bound_filter
-        context['readable_secrets'] = Secret.get_all_readable_by_user(self.request.user)
+        context['readable_secret_ids'] = Secret.get_readable_ids_in_queryset(self.request.user, context['object_list'])
         return context
 
     def get_queryset(self):
@@ -411,20 +406,23 @@ class SecretShareList(CreateView):
     template_name = 'secrets/share_content/share_list_modal.html'
 
     @cached_property
-    def group_shares(self):
-        if not self.queryset:
-            self.queryset = self.get_queryset().with_expiry_state()
-        return self.queryset.groups()
+    def shares(self) -> list[SharedSecretData]:
+        return list(self.get_queryset().with_expiry_state())
 
-    @cached_property
-    def user_shares(self):
-        if not self.queryset:
-            self.queryset = self.get_queryset().with_expiry_state()
-        return self.queryset.users()
+    @property
+    def group_shares(self) -> list[SharedSecretData]:
+        return sorted((s for s in self.shares if s.group), key=lambda s: s.group.name.casefold())
+
+    @property
+    def user_shares(self) -> list[SharedSecretData]:
+        return sorted((s for s in self.shares if s.user), key=lambda s: s.user.username.casefold())
 
     def get_queryset(self) -> SecretShareQuerySet:
-        return SharedSecretData.objects.filter(secret__hashid=self.kwargs[self.slug_url_kwarg]).prefetch_related(
-            'secret', 'user', 'group'
+        return (
+            SharedSecretData.objects
+            .filter(secret__hashid=self.kwargs[self.slug_url_kwarg])
+            .select_related('granted_by', 'user__profile', 'group')
+            .prefetch_related('group__user_set__profile')
         )
 
     def get_context_data(self, *, object_list=None, **kwargs):  # noqa: ARG002
@@ -433,6 +431,7 @@ class SecretShareList(CreateView):
         context = {
             'secret': secret,
             'shareable': secret.check_share_access(self.request.user),
+            'share_with_self': self.request.GET.get('share_with_self') == '1',
             'shares': {
                 'groups': self.group_shares,
                 'users': self.user_shares,
@@ -462,8 +461,7 @@ class SecretShareList(CreateView):
         )
 
         # Clear cache
-        delattr(self, 'group_shares')
-        delattr(self, 'user_shares')
+        del self.shares
 
         context = self.get_context_data()
         context.update({
@@ -474,29 +472,32 @@ class SecretShareList(CreateView):
             },
         })
         response = self.render_to_response(context=context)
-        if user_can_read_initial != secret.is_readable(self.request.user):
+        if self.request.GET.get('share_with_self') == '1':
+            trigger_client_event(response, 'pendingSecretsRefresh')
+        elif user_can_read_initial != secret.is_readable(self.request.user):
             response.headers['HX-Refresh'] = 'true'
         else:
             trigger_client_event(response, 'refreshMetadata')
+
         return response
 
     def get_form_class(self):
         form_class = super().get_form_class()
 
-        # Exclude groups and users which the secret was already shared with
+        # Exclude groups and users which the secret is actively (non-expired) shared with
+        active_group_names = [share.group.name for share in self.group_shares if not share.is_expired]
+        active_usernames = [share.user.username for share in self.user_shares if not share.is_expired]
         form_class.base_fields['group'].queryset = (
-            Group.objects
-            .all()
-            .exclude(name__in=self.group_shares.values_list('group__name', flat=True))
-            .order_by('name')
+            Group.objects.all().exclude(name__in=active_group_names).order_by('name')
         )
         form_class.base_fields['user'].queryset = (
-            User.objects
-            .filter(is_active=True)
-            .order_by('username')
-            .exclude(username__in=self.user_shares.values_list('user__username', flat=True))
-            .order_by('username')
+            User.objects.filter(is_active=True).exclude(username__in=active_usernames).order_by('username')
         )
+
+        if self.request.GET.get('share_with_self') == '1':
+            form_class.base_fields['user'].queryset = User.objects.filter(id=self.request.user.id)
+            form_class.base_fields['group'].queryset = Group.objects.none()
+
         return form_class
 
 
@@ -508,12 +509,9 @@ secret_share_list = login_required(SecretShareList.as_view())
 def secret_share_delete(request, hashid, share_id):
     share_data = get_object_or_404(SharedSecretData, secret__hashid=hashid, id=share_id)
     user_can_read_initial = share_data.secret.is_readable(request.user)
-    permission = share_data.secret.check_share_access(request.user)
-    if not permission:
-        raise PermissionDenied()
+    permission = share_data.check_delete_access(request.user)
 
     secret = share_data.secret
-    user_can_read_initial = secret.check_read_access(request.user)
     entity_type = share_data.shared_entity_type
     entity_name = share_data.shared_entity_name
     share_data.delete()
@@ -624,7 +622,7 @@ class SecretRevisionDetailView(TemplateView):
     def dispatch(self, request, *args, **kwargs):
         self.revision = self.get_revision()
         self.secret = self.revision.secret
-        self.read_permission = self.secret.check_read_access(request.user)
+        self.secret.check_read_access(request.user)
         return super().dispatch(request, *args, **kwargs)
 
     def get_revision(self):
@@ -700,7 +698,7 @@ class SecretRevisionDetailView(TemplateView):
             'ContentType': ContentType,
             'shown_change': self.shown_change,
             'meta': self.revision_for_display.secret,
-            'restore_allowed': self.read_permission,
+            'restore_allowed': self.secret.permission_checker(self.request.user).is_editable(),
             'restore_event': self.restore_event,
         })
         return context
