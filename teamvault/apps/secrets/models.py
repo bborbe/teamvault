@@ -2,9 +2,8 @@ import base64
 import typing as t
 from dataclasses import dataclass
 from datetime import timedelta
-from hashlib import sha256
-from json import JSONDecodeError, dumps, loads
-from operator import itemgetter
+from json import JSONDecodeError, loads
+from urllib.parse import urlsplit
 
 from cryptography.fernet import Fernet
 from django.conf import settings
@@ -13,7 +12,7 @@ from django.contrib.auth.models import Group
 from django.contrib.postgres.search import SearchVector, SearchVectorField
 from django.core.exceptions import PermissionDenied, ValidationError
 from django.db import models
-from django.db.models import BooleanField, Case, Max, Q, Value, When
+from django.db.models import BooleanField, Case, Max, Q, QuerySet, Value, When
 from django.db.models.signals import post_save
 from django.dispatch import receiver
 from django.http import Http404
@@ -25,6 +24,7 @@ from pyotp import TOTP
 
 from teamvault.apps.secrets.enums import AccessPolicy, ContentType, SecretStatus
 from .exceptions import PermissionError
+from .validators import get_otp_params_from_payload, otp_digest
 from ..audit.auditlog import log
 from ..audit.models import AuditLogCategoryChoices, LogEntry
 
@@ -38,8 +38,15 @@ class AccessPermissionTypes(models.IntegerChoices):
     SUPERUSER_ALLOWED = 3
 
 
+SCRIPT_URL_SCHEMES = frozenset({'javascript', 'data', 'vbscript'})
+
+
+def url_scheme(value: str) -> str:
+    return urlsplit(value).scheme.lower()
+
+
 def validate_url(value):
-    if '://' not in value or value.startswith('javascript:') or value.startswith('data:'):
+    if '://' not in value or url_scheme(value) in SCRIPT_URL_SCHEMES:
         raise ValidationError(_('invalid URL'))
 
 
@@ -117,11 +124,11 @@ class HashIDModel(models.Model):
         return super().save(*args, **kwargs)
 
 
-class Secret(HashIDModel):
+class Secret(HashIDModel):  # noqa: PLR0904
     HASHID_NAMESPACE = 'Secret'
 
     if t.TYPE_CHECKING:
-        from django.db.models.manager import RelatedManager
+        from django.db.models.fields.related_descriptors import RelatedManager
 
         # Django reverse relation from SharedSecretData.secret (related_name="share_data").
         share_data: 'RelatedManager[SharedSecretData]'
@@ -216,6 +223,10 @@ class Secret(HashIDModel):
     def full_url(self):
         return settings.BASE_URL.rstrip('/') + self.get_absolute_url()
 
+    @property
+    def url_is_linkable(self):
+        return bool(self.url) and url_scheme(self.url) not in SCRIPT_URL_SCHEMES
+
     def permission_checker(self, user):
         shares = self.share_data.for_user(user)
         return PermissionChecker(user=user, secret=self, shares=shares)
@@ -246,6 +257,16 @@ class Secret(HashIDModel):
         if not permissions.is_shareable():
             raise PermissionDenied()
         return permissions.is_shareable()
+
+    def check_edit_access(self, user):
+        permissions = self.permission_checker(user)
+        if not permissions.is_visible():
+            raise Http404
+
+        editable = permissions.is_editable()
+        if not editable:
+            raise PermissionDenied()
+        return editable
 
     def get_data(self, user):
         if not self.current_revision:
@@ -278,18 +299,15 @@ class Secret(HashIDModel):
         return plaintext_data
 
     def get_otp(self, request):
-        cached_otp_session_key = f'otp_key_data-{self.hashid}-{self.current_revision_id}'
-        if request.session.get(cached_otp_session_key):
-            data = request.session[cached_otp_session_key]
+        # only log the OTP access *once*
+        audited_session_key = f'otp-audited-{self.hashid}-{self.current_revision_id}'
+        if request.session.get(audited_session_key):
+            data = self.current_revision.peek_data(request.user)
         else:
             data = self.get_data(request.user)
-            request.session[cached_otp_session_key] = {
-                'otp_key': data['otp_key'],
-                'digits': int(data.get('digits', 6)),
-            }
-        otp_key = data['otp_key']
-        digits = int(data.get('digits', 6))
-        totp = TOTP(otp_key, digits=digits)
+            request.session[audited_session_key] = True
+        params = get_otp_params_from_payload(data)
+        totp = TOTP(params.otp_key, digits=params.digits, digest=otp_digest(params.algorithm))
         return totp.now()
 
     @classmethod
@@ -303,6 +321,15 @@ class Secret(HashIDModel):
             .filter(Q(access_policy=AccessPolicy.ANY) | Q(pk__in=allowed_shares))
             .exclude(status=SecretStatus.DELETED)
             .distinct()
+        )
+
+    @classmethod
+    def get_readable_ids_in_queryset(cls, user, secrets: QuerySet['Secret'] | list['Secret']):
+        return set(
+            cls
+            .get_all_readable_by_user(user)
+            .filter(pk__in=[secret.pk for secret in secrets])
+            .values_list('pk', flat=True)
         )
 
     @classmethod
@@ -339,14 +366,17 @@ class Secret(HashIDModel):
                 secret__isnull=False,
                 time__gte=since,
             )
-            .order_by('secret')
             .values('secret')
             .annotate(
                 access_count=models.Count('secret'),
             )
+            .order_by('-access_count', 'secret')[:limit]
         )
-        ordered_secrets = sorted(accessed_secrets, key=itemgetter('access_count'), reverse=True)
-        return [cls.objects.get(id=item['secret']) for item in ordered_secrets[:limit]]
+
+        ordered_secret_ids = [access['secret'] for access in accessed_secrets]
+        unordered_secrets = cls.objects.filter(id__in=ordered_secret_ids)
+        secret_map = {secret.id: secret for secret in unordered_secrets}
+        return [secret_map[secret_id] for secret_id in ordered_secret_ids if secret_id in secret_map]
 
     @classmethod
     def get_most_recently_used_for_user(cls, user, limit=5):
@@ -485,78 +515,6 @@ class SecretRevision(HashIDModel):
         return f"<SecretRevision '{self.secret.name}' ({self.hashid})>"
 
     @classmethod
-    def _create_from_secret(
-        cls,
-        *,
-        secret: Secret,
-        set_by: User,
-        plaintext_data,
-        skip_access_check: bool = False,
-    ) -> t.Self:
-        # skip_access_check is used when initially creating a secret
-        # and makes it possible to create secrets you don't have access
-        # to
-        if not skip_access_check:
-            readable = secret.permission_checker(set_by).is_readable()
-            if not readable:
-                raise PermissionError(
-                    _("{user} not allowed access to '{name}' ({id})").format(
-                        id=secret.id, name=secret.name, user=set_by.username
-                    )
-                )
-
-        content_type = secret.content_type
-        set_password = content_type == ContentType.PASSWORD and 'password' in plaintext_data
-        set_otp = content_type == ContentType.PASSWORD and 'otp_key' in plaintext_data
-
-        fernet = Fernet(settings.TEAMVAULT_SECRET_KEY)
-
-        if secret.current_revision and content_type == ContentType.PASSWORD:
-            old_dec = fernet.decrypt(secret.current_revision.encrypted_data).decode()
-            try:
-                old_data = loads(old_dec)
-            except JSONDecodeError:
-                old_data = {'password': old_dec}
-
-            if not set_password:
-                plaintext_data['password'] = old_data['password']
-            if not set_otp and 'otp_key' in old_data:
-                for k in ('otp_key', 'digits', 'algorithm'):
-                    if k in old_data:
-                        plaintext_data[k] = old_data[k]
-                        set_otp = True
-
-        if content_type == ContentType.PASSWORD and 'password' in plaintext_data:
-            sha_src = plaintext_data['password']
-        else:
-            sha_src = dumps(plaintext_data)
-
-        sha_sum = sha256(sha_src.encode('utf-8')).hexdigest()
-
-        revision, created = cls.objects.get_or_create(
-            secret=secret,
-            plaintext_data_sha256=sha_sum,
-            defaults={
-                'otp_key_set': set_otp,
-                'set_by': set_by,
-            },
-        )
-
-        if created:
-            # save the length before encoding so multi-byte characters don't
-            # mess up the result
-            revision.length = (
-                len(plaintext_data['password'])
-                if content_type == ContentType.PASSWORD and 'password' in plaintext_data
-                else len(plaintext_data)
-            )
-            revision.encrypted_data = fernet.encrypt(dumps(plaintext_data).encode())
-            revision.save()
-        revision.accessed_by.add(set_by)
-
-        return revision
-
-    @classmethod
     def _create_from_revision(
         cls,
         *,
@@ -666,7 +624,7 @@ class SecretChange(HashIDModel):
     Invariants and intent:
     - Each change points to exactly one payload revision (SecretRevision) and contains the
       metadata of the secret at that point in time.
-    - Payload rows (SecretRevision) remain deduplicated by (secret, sha256) to
+    - Payload rows (SecretRevision) remain deduplicated by (secret, payload fingerprint) to
       preserve accessed_by and needs_changing semantics. Multiple changes may
       reference the same revision when a payload recurs (e.g., after a restore).
     - History is linear: each change has at most one parent (the previous head).
@@ -932,6 +890,20 @@ class PermissionChecker:
             return AccessPermissionTypes.ALLOWED
         # Or superusers
         if self._superuser_override(ignore_allow_superuser_reads=True):
+            return AccessPermissionTypes.SUPERUSER_ALLOWED
+
+        return AccessPermissionTypes.NOT_ALLOWED
+
+    def is_editable(self) -> AccessPermissionTypes:
+        """Checks if the user may change the secret: metadata, payload, delete, restore.
+
+        A temporary share only grants reading. Letting it edit would let the
+        holder flip access_policy to ANY, share the secret to themselves
+        permanently and flip it back.
+        """
+        if self.is_readable() == AccessPermissionTypes.ALLOWED:
+            return AccessPermissionTypes.ALLOWED
+        if self._superuser_override():
             return AccessPermissionTypes.SUPERUSER_ALLOWED
 
         return AccessPermissionTypes.NOT_ALLOWED

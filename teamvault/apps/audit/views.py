@@ -1,7 +1,8 @@
 from django.contrib.auth.decorators import user_passes_test
-from django.db.models import Q
+from django.db.models import FETCH_PEERS, Q
 from django.views.generic import ListView
 
+from teamvault.paginators import EstimatingPaginator
 from .filters import AuditLogFilter
 from .models import LogEntry
 from ..secrets.models import Secret
@@ -13,10 +14,11 @@ class LogEntryList(PageSizeMixin, ListView, FilterMixin):
     filter_class = AuditLogFilter
     context_object_name = 'log_entries'
     paginate_by = 25
+    paginator_class = EstimatingPaginator
     template_name = 'audit/log.html'
 
     def get_queryset(self):
-        queryset = LogEntry.objects.all()
+        queryset = LogEntry.objects.all().fetch_mode(FETCH_PEERS)
         if 'search' in self.request.GET:
             query = self.request.GET['search']
             queryset = queryset.filter(Q(actor__icontains=query) | Q(message__icontains=query))

@@ -1,10 +1,10 @@
-from base64 import b64encode
+from base64 import b64decode, b64encode
 from contextlib import suppress
 from typing import override
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
-from django.core.exceptions import PermissionDenied
+from django.core.exceptions import PermissionDenied, ValidationError as DjangoValidationError
 from django.db import models
 from django.http import Http404
 from django.utils.timezone import now
@@ -15,6 +15,7 @@ from rest_framework.reverse import reverse
 
 from teamvault.apps.secrets.enums import AccessPolicy, ContentType as ContentTypeEnum, SecretStatus
 from ..models import Secret, SecretRevision, SharedSecretData
+from ..utils import otp_payload_fields
 
 User = get_user_model()
 
@@ -47,35 +48,79 @@ SECRET_STATUS_REPR = {
 SECRET_REPR_STATUS = {v: k for k, v in SECRET_STATUS_REPR.items()}
 
 REQUIRED_CC_FIELDS = {'holder', 'expiration_month', 'expiration_year', 'number', 'security_code'}
-STANDARD_FIELDS = {'access_policy', 'name', 'description', 'username', 'url'}
+STANDARD_FIELDS = {'access_policy', 'name', 'description', 'filename', 'username', 'url'}
 
 
-def serialize_password(secret_data):
-    return {'password': secret_data['password'], 'otp_key_data': secret_data.get('otp_key_data', '')}
+def get_required_payload_fields(secret_data, *fields) -> dict:
+    missing = [field for field in fields if field not in secret_data]
+    if missing:
+        raise serializers.ValidationError({'secret_data': {field: [_('This field is required.')] for field in missing}})
+    return {field: secret_data[field] for field in fields}
+
+
+def serialize_password(secret_data, partial: bool = False):
+    """
+    Allows partial updates via PATCH so that we can update the payload
+    without needing *all* off the payload.
+
+    So updating only the OTP key is
+    PATCH `{'otp_key_data': XYZ}`
+    instead of
+    POST `{'password': 'the_same_password', 'otp_key_data': XYZ}`.
+    """
+    payload = {} if partial and 'password' not in secret_data else get_required_payload_fields(secret_data, 'password')
+    try:
+        payload.update(otp_payload_fields(secret_data.get('otp_key_data', '')))
+    except DjangoValidationError as exc:
+        raise serializers.ValidationError({'otp_key_data': exc.messages}) from exc
+    return payload
 
 
 def serialize_cc(secret_data):
-    try:
-        return {
-            'holder': secret_data['holder'],
-            'expiration_month': secret_data['expiration_month'],
-            'expiration_year': secret_data['expiration_year'],
-            'number': secret_data['number'],
-            'security_code': secret_data['security_code'],
-            'password': secret_data['password'],
-        }
-    except KeyError as exc:
-        field = exc.args[0]
-        raise serializers.ValidationError(_('Missing required credit card field %(field)s') % {'field': field}) from exc
+    return get_required_payload_fields(
+        secret_data,
+        'holder',
+        'expiration_month',
+        'expiration_year',
+        'number',
+        'security_code',
+        'password',
+    )
 
 
 def serialize_file(secret_data):
-    return {'filename': secret_data['filename'], 'file_content': b64encode(secret_data['file_content']).decode()}
+    """
+    The payload here is exactly `{'file_content': <base64 str>}`.
+    `filename` is a field on the Secret, not payload
+    """
+    fields = get_required_payload_fields(secret_data, 'file_content')
+    return {'file_content': normalized_base64(fields['file_content'])}
 
 
-def _extract_data(secret_data, content_type: ContentTypeStr | int):
+def normalized_base64(file_content) -> str:
+    """Return `file_content` re-encoded as base64.
+
+    Since we have no bytes like object in JSON, clients have to send base64 and we store base64.
+    Line breaks are fine because base64 is commonly wrapped, but we have to
+    reject anything non-alphanumerical. (b64decode would also drop it silently)
+    """
+    invalid = serializers.ValidationError({
+        'secret_data': {'file_content': [_('Must be a non-empty base64 encoded string.')]}
+    })
+    if not isinstance(file_content, str):
+        raise invalid
+    try:
+        raw = b64decode(''.join(file_content.split()), validate=True)
+    except ValueError as exc:
+        raise invalid from exc
+    if not raw:
+        raise invalid
+    return b64encode(raw).decode('ascii')
+
+
+def _extract_data(secret_data, content_type: ContentTypeStr | int, partial: bool = False):
     if content_type in {ContentTypeStr.PASSWORD, ContentTypeEnum.PASSWORD}:
-        data = serialize_password(secret_data)
+        data = serialize_password(secret_data, partial=partial)
     elif content_type in {ContentTypeStr.CC, ContentTypeEnum.CC}:
         data = serialize_cc(secret_data)
     elif content_type in {ContentTypeStr.FILE, ContentTypeEnum.FILE}:
@@ -153,6 +198,11 @@ class SecretSerializer(serializers.HyperlinkedModelSerializer):
         write_only=True,
     )
 
+    # Decrypted payload parsed out of `secret_data`. Writing the revision needs the
+    # actor, which only the view has, so the view reads this after save() and hands
+    # it to RevisionService. None means the request carried no new payload.
+    plaintext_payload: dict | None = None
+
     def create(self, validated_data):
         try:
             content_type = validated_data.pop('content_type')
@@ -165,14 +215,11 @@ class SecretSerializer(serializers.HyperlinkedModelSerializer):
             raise serializers.ValidationError(_('Missing required field secret_data')) from exc
 
         data = _extract_data(secret_data, content_type)
-        if not data:
-            raise serializers.ValidationError("missing secret field (e.g. 'password')")
 
+        # gotta fix this once we use proper enums
+        validated_data['content_type'] = REPR_CONTENT_TYPE[content_type]
         instance: Secret = self.Meta.model.objects.create(**validated_data)
-
-        # transform string repr into integers
-        instance.content_type = REPR_CONTENT_TYPE[content_type]
-        instance._data = data
+        self.plaintext_payload = data
         instance.shared_users.add(instance.created_by)
         return instance
 
@@ -199,10 +246,16 @@ class SecretSerializer(serializers.HyperlinkedModelSerializer):
             rep['data_readable'] = False
         return rep
 
-    @staticmethod
-    def validate(data):
-        if ('file' in data) != ('filename' in data):
-            raise serializers.ValidationError(_('Must include both file and filename'))
+    def validate(self, data):
+        if self.instance is not None:
+            content_type = CONTENT_TYPE_REPR[self.instance.content_type]
+        else:
+            content_type = data.get('content_type')
+        if content_type == ContentTypeStr.FILE:
+            if self.instance is None and not data.get('filename'):
+                raise serializers.ValidationError({'filename': [_('This field is required.')]})
+        elif data.get('filename'):
+            raise serializers.ValidationError({'filename': [_('Only file secrets have a filename.')]})
         return data
 
     class Meta:
@@ -216,6 +269,7 @@ class SecretSerializer(serializers.HyperlinkedModelSerializer):
             'current_revision',
             'data_readable',
             'description',
+            'filename',
             'last_read',
             'name',
             'needs_changing_on_leave',
@@ -233,21 +287,20 @@ class SecretSerializer(serializers.HyperlinkedModelSerializer):
 
 
 class SecretDetailSerializer(SecretSerializer):
-    content_type = serializers.ChoiceField(
-        choices=ContentTypeStr.choices,
-        required=False,  # content_type is unchangeable after a secret has been created
-    )
+    # A secret's content_type is fixed at creation, so any value sent on update is dropped
+    # before validation instead of being trusted.
+    content_type = serializers.ChoiceField(choices=ContentTypeStr.choices, read_only=True)
     name = serializers.CharField(
         required=False,
     )
 
-    @staticmethod
-    def update(instance: Secret, validated_data):
+    def update(self, instance: Secret, validated_data):
         secret_data = validated_data.get('secret_data')
         if secret_data:
-            data = _extract_data(secret_data, instance.content_type)
+            partial = instance.current_revision_id is not None
+            data = _extract_data(secret_data, instance.content_type, partial=partial)
             if data:
-                instance._data = data
+                self.plaintext_payload = data
 
         for k, v in validated_data.items():
             if k in STANDARD_FIELDS:
