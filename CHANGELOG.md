@@ -8,6 +8,12 @@ Please choose versions by [Semantic Versioning](http://semver.org/).
 * MINOR version when you add functionality in a backwards-compatible manner, and
 * PATCH version when you make backwards-compatible bug fixes.
 
+## Unreleased
+
+- fix(settings): read `CSRF_TRUSTED_ORIGINS` from the environment again, so
+  login POSTs behind the reverse proxy are accepted. The fork-only fix lived
+  only on the `-fix` hotfix branches, so a release cut from `main` dropped it.
+
 ## v0.16.0
 
 - feat(watchdog): dump Python thread stacks to the log when a request exceeds
