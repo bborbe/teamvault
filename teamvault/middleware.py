@@ -4,8 +4,27 @@ from typing import TYPE_CHECKING
 from django.contrib import messages
 from django_htmx.http import trigger_client_event
 
+from teamvault import watchdog
+
 if TYPE_CHECKING:
     from django.contrib.messages.storage.base import BaseStorage, Message
+
+
+def slow_request_watchdog_middleware(get_response):
+    """Dump thread stacks when a request exceeds the slow-request threshold.
+
+    Registered first so it measures the whole request, authentication included —
+    the stall is known to fall inside the LDAP authentication path.
+    """
+
+    def middleware(request):
+        watchdog.request_started(request.path)
+        try:
+            return get_response(request)
+        finally:
+            watchdog.request_finished()
+
+    return middleware
 
 
 def htmx_message_middleware(get_response):

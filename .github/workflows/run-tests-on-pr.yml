@@ -119,3 +119,17 @@ jobs:
       - name: Run Tests
         working-directory: ${{ github.workspace }}
         run: just test
+
+  # The repo's `master-protection` ruleset requires a status check named `test`
+  # (bborbe's standard ruleset context). This workflow's own jobs are `lint`,
+  # `frontend` and the `tests` matrix, so no check named `test` was ever
+  # produced and every PR has been unmergeable since the ruleset was updated on
+  # 2026-08-26 — the required context reads as permanently expected. This
+  # aggregate job emits that context and only passes when all real jobs pass, so
+  # it satisfies the ruleset without weakening it.
+  test:
+    runs-on: ubuntu-latest
+    needs: [lint, frontend, tests]
+    steps:
+      - name: All checks passed
+        run: echo "lint, frontend and the tests matrix all succeeded"
