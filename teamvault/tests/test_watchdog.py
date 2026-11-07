@@ -6,6 +6,18 @@ from unittest import mock
 from teamvault import watchdog
 
 
+def _reset_in_flight():
+    with watchdog._lock:
+        watchdog._in_flight.clear()
+
+
+def _put_in_flight(elapsed_seconds, dumped=False):
+    ident = threading.get_ident()
+    with watchdog._lock:
+        watchdog._in_flight[ident] = (time.monotonic() - elapsed_seconds, '/slow', dumped)
+    return ident
+
+
 class ThresholdSecondsTest(unittest.TestCase):
     def test_default_when_unset(self):
         with mock.patch.dict('os.environ', {}, clear=True):
@@ -21,15 +33,8 @@ class ThresholdSecondsTest(unittest.TestCase):
 
 
 class InFlightTrackingTest(unittest.TestCase):
-    def setUp(self):
-        with watchdog._lock:
-            watchdog._in_flight.clear()
-
-    def tearDown(self):
-        with watchdog._lock:
-            watchdog._in_flight.clear()
-
     def test_started_then_finished_removes_the_entry(self):
+        _reset_in_flight()
         watchdog.request_started('/some/path')
         self.assertIn(threading.get_ident(), watchdog._in_flight)
 
@@ -37,33 +42,22 @@ class InFlightTrackingTest(unittest.TestCase):
         self.assertNotIn(threading.get_ident(), watchdog._in_flight)
 
     def test_finished_without_started_is_harmless(self):
+        _reset_in_flight()
         watchdog.request_finished()
         self.assertEqual(watchdog._in_flight, {})
 
 
 class CheckOnceTest(unittest.TestCase):
-    def setUp(self):
-        with watchdog._lock:
-            watchdog._in_flight.clear()
-
-    def tearDown(self):
-        with watchdog._lock:
-            watchdog._in_flight.clear()
-
-    def _put_in_flight(self, elapsed_seconds, dumped=False):
-        ident = threading.get_ident()
-        with watchdog._lock:
-            watchdog._in_flight[ident] = (time.monotonic() - elapsed_seconds, '/slow', dumped)
-        return ident
-
     def test_fast_request_is_not_dumped(self):
-        self._put_in_flight(elapsed_seconds=0)
+        _reset_in_flight()
+        _put_in_flight(elapsed_seconds=0)
         with mock.patch.object(watchdog, '_dump') as dump:
             self.assertEqual(watchdog.check_once(), 0)
         dump.assert_not_called()
 
     def test_slow_request_is_dumped_once(self):
-        ident = self._put_in_flight(elapsed_seconds=watchdog.DEFAULT_THRESHOLD_SECONDS + 1)
+        _reset_in_flight()
+        ident = _put_in_flight(elapsed_seconds=watchdog.DEFAULT_THRESHOLD_SECONDS + 1)
         with mock.patch.object(watchdog, '_dump') as dump:
             self.assertEqual(watchdog.check_once(), 1)
             # A second pass must not dump the same request again.
@@ -76,8 +70,11 @@ class CheckOnceTest(unittest.TestCase):
         self.assertGreater(args[2], watchdog.DEFAULT_THRESHOLD_SECONDS)
 
     def test_threshold_is_honoured_from_environment(self):
-        self._put_in_flight(elapsed_seconds=2)
-        with mock.patch.dict('os.environ', {'TEAMVAULT_SLOW_REQUEST_SECONDS': '30'}):
-            with mock.patch.object(watchdog, '_dump') as dump:
-                self.assertEqual(watchdog.check_once(), 0)
+        _reset_in_flight()
+        _put_in_flight(elapsed_seconds=2)
+        with (
+            mock.patch.dict('os.environ', {'TEAMVAULT_SLOW_REQUEST_SECONDS': '30'}),
+            mock.patch.object(watchdog, '_dump') as dump,
+        ):
+            self.assertEqual(watchdog.check_once(), 0)
         dump.assert_not_called()
