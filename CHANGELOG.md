@@ -8,6 +8,12 @@ Please choose versions by [Semantic Versioning](http://semver.org/).
 * MINOR version when you add functionality in a backwards-compatible manner, and
 * PATCH version when you make backwards-compatible bug fixes.
 
+## Unreleased
+
+- Add a slow-request watchdog that dumps Python thread stacks to the log when a
+  request exceeds `TEAMVAULT_SLOW_REQUEST_SECONDS` (default 5 s), so a blocking
+  request is captured while it is happening instead of inferred afterwards.
+
 ## v0.14.0
 
 - feat(tests): add Playwright e2e smoke tests against a deployed instance

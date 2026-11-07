@@ -64,6 +64,9 @@ LOGOUT_URL = 'accounts.logout'
 LOGGING = configure_logging(CONFIG)
 
 MIDDLEWARE = [
+    # First, so the slow-request watchdog measures the whole request including
+    # authentication — the stall is known to fall inside the LDAP auth path.
+    'teamvault.middleware.slow_request_watchdog_middleware',
     'django.middleware.security.SecurityMiddleware',
     'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
