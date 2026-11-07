@@ -10,9 +10,9 @@ Please choose versions by [Semantic Versioning](http://semver.org/).
 
 ## Unreleased
 
-- Add a slow-request watchdog that dumps Python thread stacks to the log when a
-  request exceeds `TEAMVAULT_SLOW_REQUEST_SECONDS` (default 5 s), so a blocking
-  request is captured while it is happening instead of inferred afterwards.
+- feat(watchdog): dump Python thread stacks to the log when a request exceeds
+  `TEAMVAULT_SLOW_REQUEST_SECONDS` (default 5 s), so a blocking request is
+  captured while it is happening instead of inferred afterwards.
 
 ## v0.14.0
 
